@@ -33,7 +33,7 @@ from datasets import load_dataset
 import transformers
 from transformers import (
     AutoConfig,
-    AutoModelForMultipleChoice,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
@@ -44,10 +44,12 @@ from transformers import (
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import PaddingStrategy, check_min_version, send_example_telemetry
+from transformers.trainer_utils import EvalLoopOutput, EvalPrediction
+from transformers import EarlyStoppingCallback
 
 
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.32.0.dev0")
+# # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+# check_min_version("4.32.0.dev0")
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,14 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
     )
+    test_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
+    )
+    dataset_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
+    )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
@@ -118,7 +128,7 @@ class DataTrainingArguments:
         },
     )
     pad_to_max_length: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
                 "Whether to pad all samples to the maximum sentence length. "
@@ -143,6 +153,21 @@ class DataTrainingArguments:
                 "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
                 "value if set."
             )
+        },
+    )
+    max_test_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
+                "value if set."
+            )
+        },
+    )
+    validation_split_percentage: Optional[int] = field(
+        default=5,
+        metadata={
+            "help": "The percentage of the train set used as validation set in case there's no validation split"
         },
     )
 
@@ -253,6 +278,8 @@ def main():
         + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"Training/evaluation parameters {model_args}")
+    logger.info(f"Training/evaluation parameters {data_args}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -281,27 +308,37 @@ def main():
 
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if data_args.train_file is not None or data_args.validation_file is not None:
-        data_files = {}
-        if data_args.train_file is not None:
-            data_files["train"] = data_args.train_file
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
-        extension = data_args.train_file.split(".")[-1]
-        raw_datasets = load_dataset(
-            extension,
-            data_files=data_files,
-            cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+    # if data_args.train_file is not None or data_args.validation_file is not None:
+    #     data_files = {}
+    #     if data_args.train_file is not None:
+    #         data_files["train"] = data_args.train_file
+    #     if data_args.validation_file is not None:
+    #         data_files["validation"] = data_args.validation_file
+    #     extension = data_args.train_file.split(".")[-1]
+    #     raw_datasets = load_dataset(
+    #         extension,
+    #         data_files=data_files,
+    #         cache_dir=model_args.cache_dir,
+    #         use_auth_token=True if model_args.use_auth_token else None,
+    #     )
+    # else:
+    #     # Downloading and loading the swag dataset from the hub.
+    #     raw_datasets = load_dataset(
+    #         "swag",
+    #         "regular",
+    #         cache_dir=model_args.cache_dir,
+    #         use_auth_token=True if model_args.use_auth_token else None,
+    #     )
+    if data_args.validation_file is None:
+        raw_datasets = dict()
+        raw_datasets['train'] = load_dataset("json", data_files = data_args.train_file,split=f"train[:{data_args.validation_split_percentage}%]",)
+        raw_datasets['validation'] = load_dataset("json", data_files=data_args.train_file, split= f"train[{data_args.validation_split_percentage}%:]")
+        #raw_datasets['test'] = load_dataset("json", data_files = data_args.test_file,split=f"train")
     else:
-        # Downloading and loading the swag dataset from the hub.
-        raw_datasets = load_dataset(
-            "swag",
-            "regular",
-            cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+        data_files = {"train": data_args.train_file,"validation":data_args.validation_file}
+        raw_datasets = load_dataset("json",data_files=data_files, cache_dir=model_args.cache_dir, use_auth_token=True if model_args.use_auth_token else None,)
+
+
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -323,7 +360,7 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForMultipleChoice.from_pretrained(
+    model = AutoModelForSeq2SeqLM.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
@@ -333,9 +370,9 @@ def main():
     )
 
     # When using your own dataset or a different dataset from swag, you will probably need to change this.
-    ending_names = [f"ending{i}" for i in range(4)]
-    context_name = "sent1"
-    question_header_name = "sent2"
+    # ending_names = [f"ending{i}" for i in range(4)]
+    # context_name = "sent1"
+    # question_header_name = "sent2"
 
     if data_args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
@@ -355,27 +392,96 @@ def main():
         max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     # Preprocessing the datasets.
-    def preprocess_function(examples):
-        first_sentences = [[context] * 4 for context in examples[context_name]]
-        question_headers = examples[question_header_name]
-        second_sentences = [
-            [f"{header} {examples[end][i]}" for end in ending_names] for i, header in enumerate(question_headers)
-        ]
+    def template_function(example,template):
+        templated=template.apply(example)
+        example['input']=templated[0]
+        example['target']=templated[1]
+        return example
 
-        # Flatten out
-        first_sentences = list(chain(*first_sentences))
-        second_sentences = list(chain(*second_sentences))
+    def tokenize_function(examples):
+        # for example in examples:
+        #     for template in templates:
+        #         templated= template.apply(example)
+        #         input.append(templated[0])
+        #         target.append(templated[1])
 
-        # Tokenize
-        tokenized_examples = tokenizer(
-            first_sentences,
-            second_sentences,
-            truncation=True,
-            max_length=max_seq_length,
-            padding="max_length" if data_args.pad_to_max_length else False,
-        )
-        # Un-flatten
-        return {k: [v[i : i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_examples.items()}
+        batch_encoded = tokenizer(examples['input'],truncation=True,max_length=max_seq_length,padding="max_length" if data_args.pad_to_max_length else False)
+        batch_encoded['labels']=tokenizer(examples['target'],truncation=True,max_length=max_seq_length,padding="max_length" if data_args.pad_to_max_length else False)['input_ids']
+        return batch_encoded
+        
+        # first_sentences = [[context] * 4 for context in examples[context_name]]
+        # question_headers = examples[question_header_name]
+        # second_sentences = [
+        #     [f"{header} {examples[end][i]}" for end in ending_names] for i, header in enumerate(question_headers)
+        # ]
+
+        # # Flatten out
+        # first_sentences = list(chain(*first_sentences))
+        # second_sentences = list(chain(*second_sentences))
+
+        # # Tokenize
+        # tokenized_examples = tokenizer(
+        #     first_sentences,
+        #     second_sentences,
+        #     truncation=True,
+        #     max_length=max_seq_length,
+        #     padding="max_length" if data_args.pad_to_max_length else False,
+        # )
+        # # Un-flatten
+        # return {k: [v[i : i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_examples.items()}
+    
+    # def post_processing_function(
+    #     examples: datasets.Dataset, features: datasets.Dataset, outputs: EvalLoopOutput, stage="eval"
+    # ):
+    #     '''
+    #     examples: eval_dataset; the original verison
+    #     features: eval_dataset; the processed version
+    #     output: the output of eval loop
+    #     '''
+    #     # Decode the predicted tokens.
+    #     preds = outputs.predictions
+    #     if isinstance(preds, tuple):
+    #         preds = preds[0]
+    #     # Replace -100s used for padding as we can't decode them
+    #     # -100 won't appear in the model output
+    #     preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
+    #     decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+
+    #     # Build a map example to its corresponding features.
+    #     example_id_to_index = {k: i for i, k in enumerate(examples["id"])}
+    #     feature_per_example = {example_id_to_index[feature["example_id"]]: i for i, feature in enumerate(features)}
+        
+    #     predictions = {}
+    #     # Let's loop over all the examples!
+    #     for example_index, example in enumerate(examples):
+    #         # This is the index of the feature associated to the current example.
+    #         feature_index = feature_per_example[example_index]
+    #         predictions[example["id"]] = decoded_preds[feature_index]
+
+    #     # Format the result to the format the metric expects.
+    #     if data_args.version_2_with_negative:
+    #         formatted_predictions = [
+    #             {"id": k, "prediction_text": v, "no_answer_probability": 0.0} for k, v in predictions.items()
+    #         ]
+    #     else:
+    #         formatted_predictions = [{"id": k, "prediction_text": v} for k, v in predictions.items()]
+
+    #     references = [{"id": ex["id"], "answers": ex[answer_column]} for ex in examples]
+    #    return EvalPrediction(predictions=formatted_predictions, label_ids=references)
+
+    
+    templates=[]
+    from promptsource.templates import DatasetTemplates
+    for template in DatasetTemplates(data_args.dataset_name).templates.values():
+        ignore = False
+        if not template.metadata.original_task:
+            ignore = True
+        for metric in template.metadata.metrics:
+            if metric not in ['Accuracy']:
+                ignore = True
+        if not ignore:
+            templates.append(template)
+
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -386,11 +492,19 @@ def main():
             train_dataset = train_dataset.select(range(max_train_samples))
         with training_args.main_process_first(desc="train dataset map pre-processing"):
             train_dataset = train_dataset.map(
-                preprocess_function,
+                template_function,
+                batched=False,
+                fn_kwargs={'template':templates[0]},
+                num_proc=data_args.preprocessing_num_workers,
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+            train_dataset = train_dataset.map(
+                tokenize_function,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
             )
+        
 
     if training_args.do_eval:
         if "validation" not in raw_datasets:
@@ -401,7 +515,14 @@ def main():
             eval_dataset = eval_dataset.select(range(max_eval_samples))
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
             eval_dataset = eval_dataset.map(
-                preprocess_function,
+                template_function,
+                batched=False,
+                fn_kwargs={'template':templates[0]},
+                num_proc=data_args.preprocessing_num_workers,
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+            eval_dataset = eval_dataset.map(
+                tokenize_function,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
@@ -415,10 +536,10 @@ def main():
     )
 
     # Metric
-    def compute_metrics(eval_predictions):
-        predictions, label_ids = eval_predictions
-        preds = np.argmax(predictions, axis=1)
-        return {"accuracy": (preds == label_ids).astype(np.float32).mean().item()}
+    # def compute_metrics(eval_predictions):
+    #     predictions, label_ids = eval_predictions
+    #     preds = np.argmax(predictions, axis=1)
+    #     return {"accuracy": (preds == label_ids).astype(np.float32).mean().item()}
 
     # Initialize our Trainer
     trainer = Trainer(
@@ -428,7 +549,8 @@ def main():
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=None,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
 
     # Training
@@ -462,24 +584,6 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    kwargs = {
-        "finetuned_from": model_args.model_name_or_path,
-        "tasks": "multiple-choice",
-        "dataset_tags": "swag",
-        "dataset_args": "regular",
-        "dataset": "SWAG",
-        "language": "en",
-    }
-
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
-
-
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
 
 
 if __name__ == "__main__":
