@@ -254,6 +254,10 @@ def main():
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     # send_example_telemetry("run_swag", model_args, data_args)
 
+    # special case
+    if data_args.dataset_name  == 'story_cloze':
+        data_args.dataset_name = 'story_cloze/2016'
+
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
